@@ -8,7 +8,7 @@ Built for [niri], but it also works with other compositors that support the requ
 
 ![niri-zoom demo](assets/demo.gif)
 
-[Watch the full demo](assets/nirizoom.mp4)
+[Watch the full demo](https://github.com/Ahmedhossamdev/niri-zoom/raw/master/assets/nirizoom.mp4)
 
 ## Features
 
