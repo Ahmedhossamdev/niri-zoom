@@ -1,0 +1,32 @@
+[package]
+name = "niri-zoom"
+version = "0.1.0"
+edition = "2021"
+description = "External Ctrl+scroll magnifier/zoom tool for niri and other wlr-layer-shell/screencopy Wayland compositors"
+license = "MIT"
+repository = "https://github.com/Ahmedhossamdev/niri-zoom"
+readme = "README.md"
+keywords = ["wayland", "magnifier", "zoom", "accessiblity", "niri"]
+categories = ["command-line-utilities", "multimedia::video"]
+rust-version = "1.86"
+
+[[bin]]
+name = "niri-zoomd"
+path = "src/bin/niri-zoomd.rs"
+
+[[bin]]
+name = "niri-zoomctl"
+path = "src/bin/niri-zoomctl.rs"
+
+[dependencies]
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+calloop = "0.14"
+calloop-wayland-source = "0.4"
+memmap2 = "0.9"
+rustix = { version = "1", features = ["fs", "shm", "net"] }
+
+[profile.release]
+opt-level = 3
+lto = true
