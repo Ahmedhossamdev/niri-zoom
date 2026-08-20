@@ -13,7 +13,10 @@ It does **not** patch, rebuild, or embed itself in the compositor.
 
 ## Demo
 
-<video src="https://github.com/Ahmedhossamdev/niri-zoom/raw/master/assets/nirizoom.mp4" controls></video>
+[![niri-zoom demo](assets/demo-thumb.png)](https://github.com/Ahmedhossamdev/niri-zoom/raw/master/assets/nirizoom.mp4)
+
+If the preview image doesn’t load, use the direct link:  
+🎬 https://github.com/Ahmedhossamdev/niri-zoom/raw/master/assets/nirizoom.mp4
 
 ## Who is this for?
 
