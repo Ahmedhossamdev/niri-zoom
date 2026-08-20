@@ -11,6 +11,10 @@ feature.
 
 It does **not** patch, rebuild, or embed itself in the compositor.
 
+## Demo
+
+<video src="https://github.com/Ahmedhossamdev/niri-zoom/raw/master/assets/nirizoom.mp4" controls></video>
+
 ## Who is this for?
 
 - **Anyone on Linux running a Wayland compositor that supports
