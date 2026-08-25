@@ -584,7 +584,11 @@ fn redraw_from_cache(state: &mut State, idx: usize) {
     };
     eprintln!(
         "niri-zoomd: redraw idx={idx} zoom_t={} zoom_r={:.3} active_output={:?} fx={:.1} fy={:.1}",
-        state.zoom, state.zoom_rendered, state.active_output, state.outputs[idx].focal_x, state.outputs[idx].focal_y
+        state.zoom,
+        state.zoom_rendered,
+        state.active_output,
+        state.outputs[idx].focal_x,
+        state.outputs[idx].focal_y
     );
     let (fx, fy, zoom) = {
         let o = &state.outputs[idx];
@@ -866,7 +870,10 @@ impl Dispatch<wl_callback::WlCallback, u32> for State {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let wl_callback::Event::Done { callback_data: now_ms } = event {
+        if let wl_callback::Event::Done {
+            callback_data: now_ms,
+        } = event
+        {
             let idx = *data as usize;
 
             // Compute delta time from the compositor-provided millisecond
@@ -874,7 +881,8 @@ impl Dispatch<wl_callback::WlCallback, u32> for State {
             // timestamps across sessions or unexpected compositor pauses.
             let dt = if let Some(o) = state.outputs.get_mut(idx) {
                 o.frame_cb_pending = false;
-                let elapsed_ms = o.last_frame_ms
+                let elapsed_ms = o
+                    .last_frame_ms
                     .map(|prev| now_ms.wrapping_sub(prev).min(100).max(1))
                     .unwrap_or(16); // default 16ms (≈60Hz) for the first frame
                 o.last_frame_ms = Some(now_ms);
