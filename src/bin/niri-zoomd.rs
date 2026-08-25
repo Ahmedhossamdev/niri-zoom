@@ -28,6 +28,12 @@ use niri_zoom::{glyph, socket_path, MAX_ZOOM, MIN_ZOOM, ZOOM_STEP};
 
 const NAMESPACE: &str = "niri-zoom";
 
+// Exponential-decay speed in zoom-units per second (independent of refresh rate).
+// 20 → settles to within 1% of target in ~230ms at any Hz.
+const ANIM_DECAY: f32 = 20.0;
+// Snap to target once the gap is smaller than this to avoid infinite drift.
+const ANIM_SNAP: f32 = 0.005;
+
 struct CapturedImage {
     width: i32,
     height: i32,
@@ -55,6 +61,9 @@ struct OutputInfo {
     focal_y: f64,
     frame_cb_pending: bool,
     redraw_dirty: bool,
+    // Millisecond timestamp from the previous wl_callback::Done — used to
+    // compute frame delta time for refresh-rate-independent animation.
+    last_frame_ms: Option<u32>,
     capture_in_flight: bool,
     cached: Option<CapturedImage>,
 }
@@ -74,7 +83,8 @@ struct State {
     // gave us pointer focus.
     last_enter_serial: u32,
     outputs: Vec<OutputInfo>,
-    zoom: f32,
+    zoom: f32,          // user-requested target zoom level
+    zoom_rendered: f32, // currently displayed zoom, animated toward `zoom`
     active_output: Option<usize>,
     activating: bool,
     exit: bool,
@@ -137,6 +147,7 @@ fn main() {
         last_enter_serial: 0,
         outputs: Vec::new(),
         zoom: MIN_ZOOM,
+        zoom_rendered: MIN_ZOOM,
         active_output: None,
         activating: false,
         exit: false,
@@ -271,6 +282,7 @@ fn add_output(state: &mut State, wl_output: wl_output::WlOutput, name: String) {
         focal_y: 0.0,
         frame_cb_pending: false,
         redraw_dirty: false,
+        last_frame_ms: None,
         capture_in_flight: false,
         cached: None,
     });
@@ -344,6 +356,24 @@ fn destroy_layer_surface(state: &mut State, idx: usize) {
     o.configured = false;
     o.frame_cb_pending = false;
     o.redraw_dirty = false;
+    o.last_frame_ms = None;
+}
+
+/// Advances `zoom_rendered` toward `zoom` using time-based exponential easing.
+/// `dt` is the elapsed time in seconds since the last frame. Because the step
+/// is proportional to real time (not frame count), the animation duration is
+/// the same whether the display runs at 60 Hz, 144 Hz, or 240 Hz.
+/// Returns true while still animating, false once the gap has been snapped shut.
+fn advance_zoom(state: &mut State, dt: f32) -> bool {
+    let diff = state.zoom - state.zoom_rendered;
+    if diff.abs() <= ANIM_SNAP {
+        state.zoom_rendered = state.zoom;
+        return false;
+    }
+    // Exponential ease-out: each second closes (1 - e^(-DECAY)) of the gap.
+    let factor = 1.0 - (-ANIM_DECAY * dt).exp();
+    state.zoom_rendered = (state.zoom_rendered + diff * factor).clamp(MIN_ZOOM, MAX_ZOOM);
+    true
 }
 
 fn zoom_in(state: &mut State) {
@@ -374,8 +404,8 @@ fn zoom_in(state: &mut State) {
     }
     state.zoom = (state.zoom + ZOOM_STEP).min(MAX_ZOOM);
     eprintln!(
-        "niri-zoomd: zoom_in -> {} (active_output={:?})",
-        state.zoom, state.active_output
+        "niri-zoomd: zoom_in -> target={} rendered={:.3} (active_output={:?})",
+        state.zoom, state.zoom_rendered, state.active_output
     );
     if let Some(idx) = state.active_output {
         request_redraw(state, idx);
@@ -388,18 +418,20 @@ fn zoom_out(state: &mut State) {
     }
     state.zoom = (state.zoom - ZOOM_STEP).max(MIN_ZOOM);
     eprintln!(
-        "niri-zoomd: zoom_out -> {} (active_output={:?})",
-        state.zoom, state.active_output
+        "niri-zoomd: zoom_out -> target={} rendered={:.3} (active_output={:?})",
+        state.zoom, state.zoom_rendered, state.active_output
     );
-    if state.zoom <= MIN_ZOOM {
-        deactivate(state);
-    } else if let Some(idx) = state.active_output {
+    // Don't deactivate immediately when the target reaches MIN_ZOOM — let
+    // zoom_rendered animate down smoothly and call deactivate() once it
+    // arrives (handled in the wl_callback::Done path via advance_zoom).
+    if let Some(idx) = state.active_output {
         request_redraw(state, idx);
     }
 }
 
 fn zoom_reset(state: &mut State) {
     state.zoom = MIN_ZOOM;
+    state.zoom_rendered = MIN_ZOOM; // instant exit — skip the exit animation
     deactivate(state);
 }
 
@@ -551,12 +583,12 @@ fn redraw_from_cache(state: &mut State, idx: usize) {
         None => return,
     };
     eprintln!(
-        "niri-zoomd: redraw idx={idx} zoom={} active_output={:?} fx={:.1} fy={:.1}",
-        state.zoom, state.active_output, state.outputs[idx].focal_x, state.outputs[idx].focal_y
+        "niri-zoomd: redraw idx={idx} zoom_t={} zoom_r={:.3} active_output={:?} fx={:.1} fy={:.1}",
+        state.zoom, state.zoom_rendered, state.active_output, state.outputs[idx].focal_x, state.outputs[idx].focal_y
     );
     let (fx, fy, zoom) = {
         let o = &state.outputs[idx];
-        (o.focal_x, o.focal_y, state.zoom)
+        (o.focal_x, o.focal_y, state.zoom_rendered)
     };
 
     let src_w = cached.width;
@@ -834,20 +866,49 @@ impl Dispatch<wl_callback::WlCallback, u32> for State {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let wl_callback::Event::Done { .. } = event {
+        if let wl_callback::Event::Done { callback_data: now_ms } = event {
             let idx = *data as usize;
-            let dirty = if let Some(o) = state.outputs.get_mut(idx) {
+
+            // Compute delta time from the compositor-provided millisecond
+            // timestamp. Clamp to [1ms, 100ms] to guard against stale
+            // timestamps across sessions or unexpected compositor pauses.
+            let dt = if let Some(o) = state.outputs.get_mut(idx) {
                 o.frame_cb_pending = false;
+                let elapsed_ms = o.last_frame_ms
+                    .map(|prev| now_ms.wrapping_sub(prev).min(100).max(1))
+                    .unwrap_or(16); // default 16ms (≈60Hz) for the first frame
+                o.last_frame_ms = Some(now_ms);
+                elapsed_ms as f32 / 1000.0
+            } else {
+                return;
+            };
+
+            let dirty = if let Some(o) = state.outputs.get_mut(idx) {
                 std::mem::take(&mut o.redraw_dirty)
             } else {
                 false
             };
-            // Only flush a deferred redraw if this output is still the
-            // active zoom target - otherwise a redraw queued just before
-            // deactivate() (e.g. reaching 1x) fires afterward and re-draws
-            // the stale zoomed frame over the surface deactivate() just
-            // cleared, which looked like the overlay getting stuck.
-            if dirty && state.active_output == Some(idx) {
+
+            // Guard: only animate/redraw for the active zoom output.
+            // A redraw queued just before deactivate() must NOT fire after
+            // the surfaces are already torn down (would re-paint stale content).
+            if state.active_output != Some(idx) {
+                return;
+            }
+
+            // Advance the animation one time-weighted step.
+            let still_animating = advance_zoom(state, dt);
+
+            // Once zoom_rendered winds down to MIN_ZOOM (exit animation done),
+            // tear everything down — this is what triggers the actual deactivation
+            // instead of the old immediate call in zoom_out.
+            if state.zoom_rendered <= MIN_ZOOM && state.zoom <= MIN_ZOOM {
+                state.zoom_rendered = MIN_ZOOM;
+                deactivate(state);
+                return;
+            }
+
+            if dirty || still_animating {
                 redraw_from_cache(state, idx);
             }
         }
