@@ -883,7 +883,7 @@ impl Dispatch<wl_callback::WlCallback, u32> for State {
                 o.frame_cb_pending = false;
                 let elapsed_ms = o
                     .last_frame_ms
-                    .map(|prev| now_ms.wrapping_sub(prev).min(100).max(1))
+                    .map(|prev| now_ms.wrapping_sub(prev).clamp(1, 100))
                     .unwrap_or(16); // default 16ms (≈60Hz) for the first frame
                 o.last_frame_ms = Some(now_ms);
                 elapsed_ms as f32 / 1000.0
