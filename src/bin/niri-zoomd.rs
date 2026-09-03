@@ -44,6 +44,10 @@ struct CapturedImage {
 struct OutputInfo {
     wl_output: wl_output::WlOutput,
     name: String,
+    // wl_output geometry transform (0-7, see wl_output::Transform).
+    // wlr-screencopy hands us the raw panel buffer, so we must un-rotate
+    // it with this before caching, or 90/270 outputs show sideways.
+    transform: i32,
     // None while we've deliberately torn down our own layer-surface to
     // capture a clean shot of the output behind it (see activate_output).
     surface: Option<wl_surface::WlSurface>,
@@ -272,6 +276,7 @@ fn add_output(state: &mut State, wl_output: wl_output::WlOutput, name: String) {
     state.outputs.push(OutputInfo {
         wl_output,
         name,
+        transform: 0,
         surface: None,
         layer_surface: None,
         viewport: None,
@@ -939,6 +944,12 @@ impl Dispatch<wl_output::WlOutput, ()> for State {
         };
         if let wl_output::Event::Name { name } = event {
             state.outputs[idx].name = name;
+        } else if let wl_output::Event::Geometry { transform, .. } = event {
+            let t = match transform {
+                WEnum::Value(t) => (t as u32) as i32,
+                WEnum::Unknown(u) => u as i32,
+            };
+            state.outputs[idx].transform = t;
         }
     }
 }
@@ -1147,6 +1158,150 @@ struct PendingCapture {
 thread_local! {
     static PENDING: std::cell::RefCell<std::collections::HashMap<u32, PendingCapture>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
+    static CAPTURE_Y_INVERT: std::cell::RefCell<std::collections::HashMap<u32, bool>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// wlr-screencopy hands us the raw panel buffer; the client must un-rotate
+/// it with the wl_output geometry transform to get the upright image the
+/// user actually sees (same as grim / noctalia-shell / quickshell do).
+/// Pixel ops below are verbatim ports of noctalia-shell's screencopy_util.
+fn flip_horizontal(pixels: &mut [u8], w: i32, h: i32) {
+    for y in 0..h {
+        let row = (y * w * 4) as usize;
+        for x in 0..w / 2 {
+            let l = row + (x * 4) as usize;
+            let r = row + ((w - 1 - x) * 4) as usize;
+            for c in 0..4 {
+                pixels.swap(l + c, r + c);
+            }
+        }
+    }
+}
+
+fn flip_vertical(pixels: &mut [u8], w: i32, h: i32) {
+    let row_len = (w * 4) as usize;
+    for y in 0..h / 2 {
+        let top = (y * w * 4) as usize;
+        let bottom = ((h - 1 - y) * w * 4) as usize;
+        for x in 0..row_len {
+            pixels.swap(top + x, bottom + x);
+        }
+    }
+}
+
+fn rotate_cw90(src: &[u8], src_w: i32, src_h: i32) -> (i32, i32, Vec<u8>) {
+    let dst_w = src_h;
+    let dst_h = src_w;
+    let mut dst = vec![0u8; (dst_w * dst_h * 4) as usize];
+    for sy in 0..src_h {
+        for sx in 0..src_w {
+            let dx = src_h - 1 - sy;
+            let dy = sx;
+            let sp = ((sy * src_w + sx) * 4) as usize;
+            let dp = ((dy * dst_w + dx) * 4) as usize;
+            dst[dp..dp + 4].copy_from_slice(&src[sp..sp + 4]);
+        }
+    }
+    (dst_w, dst_h, dst)
+}
+
+fn rotate_cw270(src: &[u8], src_w: i32, src_h: i32) -> (i32, i32, Vec<u8>) {
+    let dst_w = src_h;
+    let dst_h = src_w;
+    let mut dst = vec![0u8; (dst_w * dst_h * 4) as usize];
+    for sy in 0..src_h {
+        for sx in 0..src_w {
+            let dx = sy;
+            let dy = src_w - 1 - sx;
+            let sp = ((sy * src_w + sx) * 4) as usize;
+            let dp = ((dy * dst_w + dx) * 4) as usize;
+            dst[dp..dp + 4].copy_from_slice(&src[sp..sp + 4]);
+        }
+    }
+    (dst_w, dst_h, dst)
+}
+
+fn rotate_180(pixels: &mut [u8], w: i32, h: i32) {
+    let n = (w * h) as usize;
+    for i in 0..n / 2 {
+        let j = n - 1 - i;
+        for c in 0..4 {
+            pixels.swap(i * 4 + c, j * 4 + c);
+        }
+    }
+}
+
+fn apply_output_transform(
+    mut pixels: Vec<u8>,
+    mut w: i32,
+    mut h: i32,
+    transform: i32,
+) -> (i32, i32, Vec<u8>) {
+    match transform {
+        1 => {
+            let (nw, nh, np) = rotate_cw90(&pixels, w, h);
+            w = nw;
+            h = nh;
+            pixels = np;
+        }
+        2 => rotate_180(&mut pixels, w, h),
+        3 => {
+            let (nw, nh, np) = rotate_cw270(&pixels, w, h);
+            w = nw;
+            h = nh;
+            pixels = np;
+        }
+        4 => flip_horizontal(&mut pixels, w, h),
+        5 => {
+            flip_horizontal(&mut pixels, w, h);
+            let (nw, nh, np) = rotate_cw90(&pixels, w, h);
+            w = nw;
+            h = nh;
+            pixels = np;
+        }
+        6 => flip_vertical(&mut pixels, w, h),
+        7 => {
+            flip_horizontal(&mut pixels, w, h);
+            let (nw, nh, np) = rotate_cw270(&pixels, w, h);
+            w = nw;
+            h = nh;
+            pixels = np;
+        }
+        _ => {}
+    }
+    (w, h, pixels)
+}
+
+/// Converts the raw screencopy bytes (panel orientation, possibly strided
+/// and y-inverted) into a tightly-packed upright image in logical
+/// orientation, ready to cache and crop from.
+fn orient_capture(
+    raw: &[u8],
+    w: i32,
+    h: i32,
+    stride: i32,
+    y_invert: bool,
+    transform: i32,
+) -> (i32, i32, i32, Vec<u8>) {
+    let mut pixels = vec![0u8; (w * h * 4) as usize];
+    if stride == w * 4 {
+        pixels.copy_from_slice(&raw[..(w * h * 4) as usize]);
+    } else {
+        for y in 0..h {
+            let sp = (y * stride) as usize;
+            let dp = (y * w * 4) as usize;
+            pixels[dp..dp + (w * 4) as usize].copy_from_slice(&raw[sp..sp + (w * 4) as usize]);
+        }
+    }
+    // y_invert describes the raw panel buffer itself, so un-flip in panel
+    // space first (like grim does), then un-rotate to logical orientation.
+    if y_invert {
+        flip_vertical(&mut pixels, w, h);
+    }
+    let (w, h, pixels) = apply_output_transform(pixels, w, h, transform);
+    let stride = w * 4;
+    (w, h, stride, pixels)
 }
 
 impl Dispatch<zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1, u32> for State {
@@ -1211,8 +1366,19 @@ impl Dispatch<zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1, u32> for State {
                 }
                 capture_aborted(state, idx as usize);
             }
+            zwlr_screencopy_frame_v1::Event::Flags { flags } => {
+                let y_invert = match flags {
+                    WEnum::Value(f) => f.contains(zwlr_screencopy_frame_v1::Flags::YInvert),
+                    WEnum::Unknown(bits) => bits & 1 != 0,
+                };
+                CAPTURE_Y_INVERT.with(|m| {
+                    m.borrow_mut().insert(idx, y_invert);
+                });
+            }
             zwlr_screencopy_frame_v1::Event::Ready { .. } => {
                 let data = CAPTURE_BUFFERS.with(|c| c.borrow_mut().remove(&idx));
+                let y_invert =
+                    CAPTURE_Y_INVERT.with(|m| m.borrow_mut().remove(&idx).unwrap_or(false));
                 if let Some((mmap, width, height, stride)) = data {
                     if let Some(o) = state.outputs.get_mut(idx as usize) {
                         // Only keep the frame if this output is still the
@@ -1222,11 +1388,14 @@ impl Dispatch<zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1, u32> for State {
                         // buffer alongside the cached frames deactivate()
                         // already dropped.
                         if state.active_output == Some(idx as usize) {
+                            let transform = o.transform;
+                            let (w, h, s, bytes) =
+                                orient_capture(&mmap, width, height, stride, y_invert, transform);
                             o.cached = Some(CapturedImage {
-                                width,
-                                height,
-                                stride,
-                                bytes: mmap.to_vec(),
+                                width: w,
+                                height: h,
+                                stride: s,
+                                bytes,
                             });
                         }
                         o.capture_in_flight = false;
@@ -1238,6 +1407,9 @@ impl Dispatch<zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1, u32> for State {
             zwlr_screencopy_frame_v1::Event::Failed => {
                 eprintln!("niri-zoomd: capture Failed for output {idx}");
                 frame.destroy();
+                CAPTURE_Y_INVERT.with(|m| {
+                    m.borrow_mut().remove(&idx);
+                });
                 if let Some(o) = state.outputs.get_mut(idx as usize) {
                     o.capture_in_flight = false;
                 }
